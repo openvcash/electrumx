@@ -161,8 +161,11 @@ class Daemon(util.LoggedClass):
     async def _send_single(self, method, params=None):
         '''Send a single request to the daemon.'''
         def processor(result):
-            err = result['error']
-            if not err:
+            if 'error' in result:
+                err = result['error']
+                if not err:
+                    return result['result']
+            else:
                 return result['result']
             if err.get('code') == self.WARMING_UP:
                 raise self.DaemonWarmingUpError
@@ -180,7 +183,7 @@ class Daemon(util.LoggedClass):
         If replace_errs is true, any item with an error is returned as None,
         otherwise an exception is raised.'''
         def processor(result):
-            errs = [item['error'] for item in result if item['error']]
+            errs = [item['error'] for item in result if 'error' in item and item['error']]
             if any(err.get('code') == self.WARMING_UP for err in errs):
                 raise self.DaemonWarmingUpError
             if not errs or replace_errs:
