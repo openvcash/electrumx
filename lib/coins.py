@@ -46,7 +46,7 @@ from server.daemon import Daemon, DashDaemon, LegacyRPCDaemon
 from server.session import ElectrumX, DashElectrumX
 
 
-Block = namedtuple("Block", "header transactions")
+Block = namedtuple("Block", "raw header transactions")
 
 
 class CoinError(Exception):
@@ -270,12 +270,11 @@ class Coin(object):
         return block[:cls.static_header_len(height)]
 
     @classmethod
-    def block_full(cls, block, height):
-        '''Returns (header, [(deserialized_tx, tx_hash), ...]) given a
-        block and its height.'''
-        header = cls.block_header(block, height)
-        txs = cls.DESERIALIZER(block[len(header):]).read_tx_block()
-        return Block(header, txs)
+    def block(cls, raw_block, height):
+        '''Return a Block namedtuple given a raw block and its height.'''
+        header = cls.block_header(raw_block, height)
+        txs = cls.DESERIALIZER(raw_block, start=len(header)).read_tx_block()
+        return Block(raw_block, header, txs)
 
     @classmethod
     def decimal_value(cls, value):
@@ -314,8 +313,8 @@ class AuxPowMixin(object):
     @classmethod
     def block_header(cls, block, height):
         '''Return the AuxPow block header bytes'''
-        block = cls.DESERIALIZER(block)
-        return block.read_header(height, cls.BASIC_HEADER_SIZE)
+        deserializer = cls.DESERIALIZER(block)
+        return deserializer.read_header(height, cls.BASIC_HEADER_SIZE)
 
 
 class Bitcoin(Coin):
@@ -348,7 +347,11 @@ class Bitcoin(Coin):
         'ozahtqwp25chjdjd.onion s t',
         'us11.einfachmalnettsein.de s t',
         'ELEX01.blackpole.online s t',
-        'electrum_abc.criptolayer.net s50012',
+        'electroncash.cascharia.com s50002',
+        'electrum-abc.criptolayer.net s50012',
+        '35.185.209.69 s t',
+        '35.197.25.235 s t',
+        'bcc.arihanc.com t52001 s52002',
     ]
 
 
@@ -381,6 +384,16 @@ class BitcoinTestnet(Bitcoin):
         'hsmithsxurybd7uh.onion t53011 s53012',
         'ELEX05.blackpole.online t52001 s52002',
     ]
+
+
+class BitcoinRegtest(BitcoinTestnet):
+    NET = "regtest"
+    GENESIS_HASH = ('0f9188f13cb7b2c71f2a335e3a4fc328'
+                    'bf5beb436012afca590b1a11466e2206')
+    PEERS= []
+    TX_COUNT = 1
+    TX_COUNT_HEIGHT = 1
+    DESERIALIZER = DeserializerSegWit
 
 
 class BitcoinTestnetSegWit(BitcoinTestnet):
@@ -703,14 +716,12 @@ class FairCoin(Coin):
     ]
 
     @classmethod
-    def block_full(cls, block, height):
-        '''Returns (header, [(deserialized_tx, tx_hash), ...]) given a
-        block and its height.'''
-
+    def block(cls, raw_block, height):
+        '''Return a Block namedtuple given a raw block and its height.'''
         if height > 0:
-            return super().block_full(block, height)
+            return super().block(raw_block, height)
         else:
-            return Block(cls.block_header(block, height), [])
+            return Block(raw_block, cls.block_header(raw_block, height), [])
 
     @classmethod
     def electrum_header(cls, header, height):
@@ -765,8 +776,8 @@ class Zcash(Coin):
     @classmethod
     def block_header(cls, block, height):
         '''Return the block header bytes'''
-        block = cls.DESERIALIZER(block)
-        return block.read_header(height, cls.BASIC_HEADER_SIZE)
+        deserializer = cls.DESERIALIZER(block)
+        return deserializer.read_header(height, cls.BASIC_HEADER_SIZE)
 
 
 class Einsteinium(Coin):
@@ -818,7 +829,7 @@ class Blackcoin(Coin):
         if version > 6:
             return super().header_hash(header)
         else:
-            return cls.HEADER_HASH(header);
+            return cls.HEADER_HASH(header)
 
 
 class Peercoin(Coin):
@@ -857,6 +868,44 @@ class Reddcoin(Coin):
     IRC_PREFIX = "E_"
     IRC_CHANNEL = "#electrum-rdd"
     RPC_PORT = 45443
+
+
+class Vertcoin(Coin):
+    NAME = "Vertcoin"
+    SHORTNAME = "VTC"
+    NET = "mainnet"
+    XPUB_VERBYTES = bytes.fromhex("0488B21E")
+    XPRV_VERBYTES = bytes.fromhex("0488ADE4")
+    P2PKH_VERBYTE = bytes.fromhex("47")
+    P2SH_VERBYTES = [bytes.fromhex("05")]
+    WIF_BYTE = bytes.fromhex("80")
+    GENESIS_HASH = ('4d96a915f49d40b1e5c2844d1ee2dccb'
+                    '90013a990ccea12c492d22110489f0c4')
+    DESERIALIZER = DeserializerSegWit
+    TX_COUNT = 2383423
+    TX_COUNT_HEIGHT = 759076
+    TX_PER_BLOCK = 3
+    RPC_PORT = 5888
+    REORG_LIMIT = 1000
+
+
+class Monacoin(Coin):
+    NAME = "Monacoin"
+    SHORTNAME = "MONA"
+    NET = "mainnet"
+    XPUB_VERBYTES = bytes.fromhex("0488B21E")
+    XPRV_VERBYTES = bytes.fromhex("0488ADE4")
+    P2PKH_VERBYTE = bytes.fromhex("32")
+    P2SH_VERBYTES = [bytes.fromhex("37"), bytes.fromhex("05")]
+    WIF_BYTE = bytes.fromhex("B2")
+    GENESIS_HASH = ('ff9f1c0116d19de7c9963845e129f9ed'
+                    '1bfc0b376eb54fd7afa42e0d418c8bb6')
+    DESERIALIZER = DeserializerSegWit
+    TX_COUNT = 2568580
+    TX_COUNT_HEIGHT = 1029766
+    TX_PER_BLOCK = 2
+    RPC_PORT = 9402
+    REORG_LIMIT = 1000
 
 class Vcash(Coin):
     NAME = "Vcash"
