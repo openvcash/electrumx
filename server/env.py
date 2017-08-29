@@ -66,6 +66,7 @@ class Env(lib_util.LoggedClass):
         self.max_session_subs = self.integer('MAX_SESSION_SUBS', 50000)
         self.bandwidth_limit = self.integer('BANDWIDTH_LIMIT', 2000000)
         self.session_timeout = self.integer('SESSION_TIMEOUT', 600)
+        self.loop_policy = self.event_loop_policy()
         # IRC
         self.irc = self.boolean('IRC', False)
         self.irc_nick = self.default('IRC_NICK', None)
@@ -108,7 +109,7 @@ class Env(lib_util.LoggedClass):
         # We give the DB 250 files; allow ElectrumX 100 for itself
         value = max(0, min(env_value, nofile_limit - 350))
         if value < env_value:
-            self.log_warning('lowered maximum seessions from {:,d} to {:,d} '
+            self.log_warning('lowered maximum sessions from {:,d} to {:,d} '
                              'because your open file limit is {:,d}'
                              .format(env_value, value, nofile_limit))
         return value
@@ -173,3 +174,12 @@ class Env(lib_util.LoggedClass):
             ssl_port,
             '_tor',
         )
+
+    def event_loop_policy(self):
+        policy = self.default('EVENT_LOOP_POLICY', None)
+        if policy is None:
+            return None
+        if policy == 'uvloop':
+            import uvloop
+            return uvloop.EventLoopPolicy()
+        raise self.Error('unknown event loop policy "{}"'.format(policy))

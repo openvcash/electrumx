@@ -63,6 +63,9 @@ These environment variables are optional:
   Must be a *NET* from one of the **Coin** classes in `lib/coins.py`_.
   Defaults to `mainnet`.
 
+  Note: if you are using Bitcoin Core post the August 1st fork, you
+  should have NET be `bitcoin-segwit`, and if on the Bitcoin Cash
+  chain NET should be `mainnet`.
   Note Bitcoin Core >= 0.13.1 requires a special *NET* for testnet:
   `testnet-segwit`.
 
@@ -101,6 +104,14 @@ These environment variables are optional:
   ElectrumX listens for RPC connections unless this is explicitly set
   to blank.  The default is appropriate for **COIN** and **NET**
   (e.g., 8000 for Bitcoin mainnet) if not set.
+
+* **EVENT_LOOP_POLICY**
+
+  The name of an event loop policy to replace the default asyncio
+  policy, if any.  At present only `uvloop` is accepted, in which case
+  you must have installed the `uvloop`_ Python package.
+
+  If you are not sure what this means leave it unset.
 
 * **DONATION_ADDRESS**
 
@@ -369,3 +380,4 @@ your available physical RAM:
   variables is roughly equivalent.
 
 .. _lib/coins.py: https://github.com/kyuupichan/electrumx/blob/master/lib/coins.py
+.. _uvloop: https://pypi.python.org/pypi/uvloop
