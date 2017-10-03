@@ -8,9 +8,7 @@
 import asyncio
 import json
 import os
-import signal
 import ssl
-import sys
 import time
 import traceback
 from bisect import bisect_left
@@ -23,6 +21,7 @@ import pylru
 from lib.jsonrpc import JSONSessionBase, RPCError
 from lib.hash import double_sha256, hash_to_str, hex_str_to_hash
 from lib.peer import Peer
+from lib.server_base import ServerBase
 import lib.util as util
 from server.daemon import DaemonError
 from server.mempool import MemPool
@@ -30,47 +29,22 @@ from server.peers import PeerManager
 from server.session import LocalRPC
 
 
-class Controller(util.LoggedClass):
+class Controller(ServerBase):
     '''Manages the client servers, a mempool, and a block processor.
 
     Servers are started immediately the block processor first catches
     up with the daemon.
     '''
 
+    PYTHON_MIN_VERSION = (3, 5, 3)
     BANDS = 5
     CATCHING_UP, LISTENING, PAUSED, SHUTTING_DOWN = range(4)
-    SUPPRESS_MESSAGES = [
-        'Fatal read error on socket transport',
-        'Fatal write error on socket transport',
-    ]
 
     def __init__(self, env):
-        super().__init__()
+        '''Initialize everything that doesn't require the event loop.'''
+        super().__init__(env)
 
-        # Sanity checks
-        if sys.version_info < (3, 5, 3):
-            raise RuntimeError('Python >= 3.5.3 is required to run ElectrumX')
-
-        if os.geteuid() == 0:
-            raise RuntimeError('DO NOT RUN AS ROOT! Create an unprivileged '
-                               'user account and use that')
-
-        # Set the event loop policy before doing anything asyncio
-        self.logger.info('event loop policy: {}'.format(env.loop_policy))
-        asyncio.set_event_loop_policy(env.loop_policy)
-        self.loop = asyncio.get_event_loop()
-
-        # Set this event to cleanly shutdown
-        self.shutdown_event = asyncio.Event()
-        self.executor = ThreadPoolExecutor()
-        self.loop.set_default_executor(self.executor)
-        self.start_time = time.time()
         self.coin = env.coin
-        self.daemon = self.coin.DAEMON(env)
-        self.bp = self.coin.BLOCK_PROCESSOR(env, self, self.daemon)
-        self.mempool = MemPool(self.bp, self)
-        self.peer_mgr = PeerManager(env, self)
-        self.env = env
         self.servers = {}
         # Map of session to the key of its list in self.groups
         self.sessions = {}
@@ -94,19 +68,47 @@ class Controller(util.LoggedClass):
         cmds = ('add_peer daemon_url disconnect getinfo groups log peers reorg '
                 'sessions stop'.split())
         self.rpc_handlers = {cmd: getattr(self, 'rpc_' + cmd) for cmd in cmds}
-        # Set up the ElectrumX request handlers
-        rpcs = [
-            ('blockchain',
-             'address.get_balance address.get_history address.get_mempool '
-             'address.get_proof address.listunspent '
-             'block.get_header estimatefee relayfee '
-             'transaction.get transaction.get_merkle utxo.get_address'),
-            ('server', 'donation_address'),
-        ]
-        self.electrumx_handlers = {'.'.join([prefix, suffix]):
-                                   getattr(self, suffix.replace('.', '_'))
-                                   for prefix, suffixes in rpcs
-                                   for suffix in suffixes.split()}
+
+        self.loop = asyncio.get_event_loop()
+        self.executor = ThreadPoolExecutor()
+        self.loop.set_default_executor(self.executor)
+
+        # The complex objects.  Note PeerManager references self.loop (ugh)
+        self.daemon = self.coin.DAEMON(env)
+        self.bp = self.coin.BLOCK_PROCESSOR(env, self, self.daemon)
+        self.mempool = MemPool(self.bp, self)
+        self.peer_mgr = PeerManager(env, self)
+
+    async def start_servers(self):
+        '''Start the RPC server and schedule the external servers to be
+        started once the block processor has caught up.
+        '''
+        if self.env.rpc_port is not None:
+            await self.start_server('RPC', self.env.cs_host(for_rpc=True),
+                                    self.env.rpc_port)
+
+        self.ensure_future(self.bp.main_loop())
+        self.ensure_future(self.wait_for_bp_catchup())
+
+    async def shutdown(self):
+        '''Perform the shutdown sequence.'''
+        self.state = self.SHUTTING_DOWN
+
+        # Close servers and sessions
+        self.close_servers(list(self.servers.keys()))
+        for session in self.sessions:
+            self.close_session(session)
+
+        # Cancel pending futures
+        for future in self.futures:
+            future.cancel()
+
+        # Wait for all futures to finish
+        while not all(future.done() for future in self.futures):
+            await asyncio.sleep(0.1)
+
+        # Finally shut down the block processor and executor
+        self.bp.shutdown(self.executor)
 
     async def mempool_transactions(self, hashX):
         '''Generate (hex_hash, tx_fee, unconfirmed) tuples for mempool
@@ -205,57 +207,15 @@ class Controller(util.LoggedClass):
                 self.next_log_sessions = time.time() + self.env.log_sessions
 
     async def wait_for_bp_catchup(self):
-        '''Called when the block processor catches up.'''
+        '''Wait for the block processor to catch up, then kick off server
+        background processes.'''
         await self.bp.caught_up_event.wait()
         self.logger.info('block processor has caught up')
         self.ensure_future(self.peer_mgr.main_loop())
-        self.ensure_future(self.start_servers())
+        self.ensure_future(self.log_start_external_servers())
         self.ensure_future(self.housekeeping())
         self.ensure_future(self.mempool.main_loop())
         self.ensure_future(self.notify())
-
-    async def main_loop(self):
-        '''Controller main loop.'''
-        if self.env.rpc_port is not None:
-            await self.start_server('RPC', ('127.0.0.1', '::1'),
-                                    self.env.rpc_port)
-        self.ensure_future(self.bp.main_loop())
-        self.ensure_future(self.wait_for_bp_catchup())
-
-        # Shut down cleanly after waiting for shutdown to be signalled
-        await self.shutdown_event.wait()
-        self.logger.info('shutting down')
-        await self.shutdown()
-        # Avoid log spew on shutdown for partially opened SSL sockets
-        try:
-            del asyncio.sslproto._SSLProtocolTransport.__del__
-        except Exception:
-            pass
-        self.logger.info('shutdown complete')
-
-    def initiate_shutdown(self):
-        '''Call this function to start the shutdown process.'''
-        self.shutdown_event.set()
-
-    async def shutdown(self):
-        '''Perform the shutdown sequence.'''
-        self.state = self.SHUTTING_DOWN
-
-        # Close servers and sessions
-        self.close_servers(list(self.servers.keys()))
-        for session in self.sessions:
-            self.close_session(session)
-
-        # Cancel pending futures
-        for future in self.futures:
-            future.cancel()
-
-        # Wait for all futures to finish
-        while not all(future.done() for future in self.futures):
-            await asyncio.sleep(0.1)
-
-        # Finally shut down the block processor and executor
-        self.bp.shutdown(self.executor)
 
     def close_servers(self, kinds):
         '''Close the servers of the given kinds (TCP etc.).'''
@@ -282,7 +242,7 @@ class Controller(util.LoggedClass):
             self.logger.info('{} server listening on {}:{:d}'
                              .format(kind, host, port))
 
-    async def start_servers(self):
+    async def log_start_external_servers(self):
         '''Start TCP and SSL servers.'''
         self.logger.info('max session count: {:,d}'.format(self.max_sessions))
         self.logger.info('session timeout: {:,d} seconds'
@@ -305,12 +265,13 @@ class Controller(util.LoggedClass):
         self.state = self.LISTENING
 
         env = self.env
+        host = env.cs_host(for_rpc=False)
         if env.tcp_port is not None:
-            await self.start_server('TCP', env.host, env.tcp_port)
+            await self.start_server('TCP', host, env.tcp_port)
         if env.ssl_port is not None:
             sslc = ssl.SSLContext(ssl.PROTOCOL_TLS)
             sslc.load_cert_chain(env.ssl_certfile, keyfile=env.ssl_keyfile)
-            await self.start_server('SSL', env.host, env.ssl_port, ssl=sslc)
+            await self.start_server('SSL', host, env.ssl_port, ssl=sslc)
 
     async def notify(self):
         '''Notify sessions about height changes and touched addresses.'''
@@ -329,7 +290,8 @@ class Controller(util.LoggedClass):
                 self.header_cache.clear()
 
             # Make a copy; self.sessions can change whilst await-ing
-            sessions = [s for s in self.sessions if isinstance(s, self.coin.SESSIONCLS)]
+            sessions = [s for s in self.sessions
+                        if isinstance(s, self.coin.SESSIONCLS)]
             for session in sessions:
                 await session.notify(self.bp.db_height, touched)
 
@@ -542,13 +504,14 @@ class Controller(util.LoggedClass):
         '''A generator returning lines for a list of sessions.
 
         data is the return value of rpc_sessions().'''
-        fmt = ('{:<6} {:<5} {:>17} {:>5} {:>5} '
+        fmt = ('{:<6} {:<5} {:>17} {:>5} {:>5} {:>5} '
                '{:>7} {:>7} {:>7} {:>7} {:>7} {:>9} {:>21}')
-        yield fmt.format('ID', 'Flags', 'Client', 'Reqs', 'Txs', 'Subs',
+        yield fmt.format('ID', 'Flags', 'Client', 'Proto',
+                         'Reqs', 'Txs', 'Subs',
                          'Recv', 'Recv KB', 'Sent', 'Sent KB', 'Time', 'Peer')
-        for (id_, flags, peer, client, reqs, txs_sent, subs,
+        for (id_, flags, peer, client, proto, reqs, txs_sent, subs,
              recv_count, recv_size, send_count, send_size, time) in data:
-            yield fmt.format(id_, flags, client,
+            yield fmt.format(id_, flags, client, proto,
                              '{:,d}'.format(reqs),
                              '{:,d}'.format(txs_sent),
                              '{:,d}'.format(subs),
@@ -566,6 +529,7 @@ class Controller(util.LoggedClass):
                  session.flags(),
                  session.peername(for_log=for_log),
                  session.client,
+                 session.protocol_version,
                  session.count_pending_items(),
                  session.txs_sent,
                  session.sub_count(),
@@ -634,7 +598,7 @@ class Controller(util.LoggedClass):
 
     def rpc_stop(self):
         '''Shut down the server cleanly.'''
-        self.initiate_shutdown()
+        self.shutdown_event.set()
         return 'stopping'
 
     def rpc_getinfo(self):
@@ -672,20 +636,20 @@ class Controller(util.LoggedClass):
             pass
         raise RPCError('{} is not a valid address'.format(address))
 
-    def script_hash_to_hashX(self, script_hash):
+    def scripthash_to_hashX(self, scripthash):
         try:
-            bin_hash = hex_str_to_hash(script_hash)
+            bin_hash = hex_str_to_hash(scripthash)
             if len(bin_hash) == 32:
                 return bin_hash[:self.coin.HASHX_LEN]
         except Exception:
             pass
-        raise RPCError('{} is not a valid script hash'.format(script_hash))
+        raise RPCError('{} is not a valid script hash'.format(scripthash))
 
     def assert_tx_hash(self, value):
         '''Raise an RPCError if the value is not a valid transaction
         hash.'''
         try:
-            if len(bytes.fromhex(value)) == 32:
+            if len(util.hex_to_bytes(value)) == 32:
                 return
         except Exception:
             pass
@@ -801,14 +765,29 @@ class Controller(util.LoggedClass):
         hashX = self.address_to_hashX(address)
         return await self.get_balance(hashX)
 
+    async def scripthash_get_balance(self, scripthash):
+        '''Return the confirmed and unconfirmed balance of a scripthash.'''
+        hashX = self.scripthash_to_hashX(scripthash)
+        return await self.get_balance(hashX)
+
     async def address_get_history(self, address):
         '''Return the confirmed and unconfirmed history of an address.'''
         hashX = self.address_to_hashX(address)
         return await self.confirmed_and_unconfirmed_history(hashX)
 
+    async def scripthash_get_history(self, scripthash):
+        '''Return the confirmed and unconfirmed history of a scripthash.'''
+        hashX = self.scripthash_to_hashX(scripthash)
+        return await self.confirmed_and_unconfirmed_history(hashX)
+
     async def address_get_mempool(self, address):
         '''Return the mempool transactions touching an address.'''
         hashX = self.address_to_hashX(address)
+        return await self.unconfirmed_history(hashX)
+
+    async def scripthash_get_mempool(self, scripthash):
+        '''Return the mempool transactions touching a scripthash.'''
+        hashX = self.scripthash_to_hashX(scripthash)
         return await self.unconfirmed_history(hashX)
 
     async def address_get_proof(self, address):
@@ -819,6 +798,13 @@ class Controller(util.LoggedClass):
     async def address_listunspent(self, address):
         '''Return the list of UTXOs of an address.'''
         hashX = self.address_to_hashX(address)
+        return [{'tx_hash': hash_to_str(utxo.tx_hash), 'tx_pos': utxo.tx_pos,
+                 'height': utxo.height, 'value': utxo.value}
+                for utxo in sorted(await self.get_utxos(hashX))]
+
+    async def scripthash_listunspent(self, scripthash):
+        '''Return the list of UTXOs of a scripthash.'''
+        hashX = self.scripthash_to_hashX(scripthash)
         return [{'tx_hash': hash_to_str(utxo.tx_hash), 'tx_pos': utxo.tx_pos,
                  'height': utxo.height, 'value': utxo.value}
                 for utxo in sorted(await self.get_utxos(hashX))]
@@ -844,16 +830,22 @@ class Controller(util.LoggedClass):
         to the daemon's memory pool.'''
         return await self.daemon_request('relayfee')
 
-    async def transaction_get(self, tx_hash, height=None):
+    async def transaction_get(self, tx_hash):
+        '''Return the serialized raw transaction given its hash
+
+        tx_hash: the transaction hash as a hexadecimal string
+        '''
+        self.assert_tx_hash(tx_hash)
+        return await self.daemon_request('getrawtransaction', tx_hash)
+
+    async def transaction_get_1_0(self, tx_hash, height=None):
         '''Return the serialized raw transaction given its hash
 
         tx_hash: the transaction hash as a hexadecimal string
         height: ignored, do not use
         '''
-        # For some reason Electrum passes a height.  We don't require
-        # it in anticipation it might be dropped in the future.
-        self.assert_tx_hash(tx_hash)
-        return await self.daemon_request('getrawtransaction', tx_hash)
+        # For some reason Electrum protocol 1.0 passes a height.
+        return await self.transaction_get(tx_hash)
 
     async def transaction_get_merkle(self, tx_hash, height):
         '''Return the markle tree to a confirmed transaction given its hash
@@ -880,43 +872,8 @@ class Controller(util.LoggedClass):
         raw_tx = await self.daemon_request('getrawtransaction', tx_hash)
         if not raw_tx:
             return None
-        raw_tx = bytes.fromhex(raw_tx)
+        raw_tx = util.hex_to_bytes(raw_tx)
         tx, tx_hash = self.coin.DESERIALIZER(raw_tx).read_tx()
         if index >= len(tx.outputs):
             return None
         return self.coin.address_from_script(tx.outputs[index].pk_script)
-
-    # Client RPC "server" command handlers
-
-    def donation_address(self):
-        '''Return the donation address as a string, empty if there is none.'''
-        return self.env.donation_address
-
-    # Signal, exception handlers.
-
-    def on_signal(self, signame):
-        '''Call on receipt of a signal to cleanly shutdown.'''
-        self.logger.warning('received {} signal, initiating shutdown'
-                            .format(signame))
-        self.initiate_shutdown()
-
-    def on_exception(self, loop, context):
-        '''Suppress spurious messages it appears we cannot control.'''
-        message = context.get('message')
-        if message not in self.SUPPRESS_MESSAGES:
-            if not ('task' in context and
-                    'accept_connection2()' in repr(context.get('task'))):
-                loop.default_exception_handler(context)
-
-    def run(self):
-        # Install signal handlers and exception handler
-        loop = self.loop
-        for signame in ('SIGINT', 'SIGTERM'):
-            loop.add_signal_handler(getattr(signal, signame),
-                                    partial(self.on_signal, signame))
-        loop.set_exception_handler(self.on_exception)
-
-        # Run the main loop to completion
-        future = asyncio.ensure_future(self.main_loop())
-        loop.run_until_complete(future)
-        loop.close()
