@@ -1122,7 +1122,7 @@ class Vcash(Coin):
     IRC_PREFIX = "E_"
     IRC_CHANNEL = "#electrum-xvc"
     RPC_PORT = 9195
-    DESERIALIZER = DeserializerTxTime
+    DESERIALIZER = lib_tx.DeserializerTxTime
     TX_COUNT = 1207218
     TX_COUNT_HEIGHT = 637842
     TX_PER_BLOCK = 2
