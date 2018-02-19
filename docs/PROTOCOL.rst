@@ -5,11 +5,11 @@ Electrum Protocol
 This is intended to be a reference for client and server authors
 alike.
 
-I have attempted to ensure what is written is correct for the three
-known server implementations: electrum-server, jelectrum and
-ElectrumX, and also for Electrum clients of the 2.x series.  We know
-other clients exist but I am not aware of the source of any being
-publicly available.
+I have attempted to ensure what is written is correct for the two
+known remaining server implementations: jelectrum and ElectrumX, and
+also for Electrum clients of the 2.x series.  We know other clients
+exist but I am not aware of the source of any being publicly
+available.
 
 
 Message Stream
@@ -25,14 +25,14 @@ requests should limit their size depending on the nature of their
 query, because servers will limit response size as an anti-DoS
 mechanism.
 
-RPC calls and responses are separated by newlines in the stream.  The
-JSON specification does not permit control characters within strings,
-so no confusion is possible there.  However it does permit newlines as
-extraneous whitespace between elements; client and server MUST NOT use
-newlines in such a way.
+Eeach RPC call, and each response, is separated by a single newline in
+their respective streams.  The JSON specification does not permit
+control characters within strings, so no confusion is possible there.
+However it does permit newlines as extraneous whitespace between
+elements; client and server MUST NOT use newlines in such a way.
 
 If using JSON RPC 2.0's feature of parameter passing by name, the
-names shown in the protocol versions's description MUST be used.
+names shown in the protocol version's description MUST be used.
 
 A server advertising support for a particular protocol version MUST
 support each method documented for that protocol version, unless the
@@ -40,6 +40,7 @@ method is explicitly marked optional.  It may support other methods or
 additional parameters with unspecified behaviour.  Use of additional
 parameters is discouraged as it may conflict with future versions of
 the protocol.
+
 
 Notifications
 -------------
@@ -73,6 +74,58 @@ possible in order to negotiate the precise protocol version; see its
 description for more detail.  All responses received in the stream
 from and including the server's response to this call will use the
 negotiated protocol version.
+
+
+Script Hashes
+-------------
+
+A script hash is the hash of the binary bytes of the locking script
+(ScriptPubKey), expressed as a hexadecimal string.  The hash function
+to use is given by the "hash_function" member of `server.features`
+(currently "sha256" only).  Like for block and transaction hashes, when
+converting the big-endian binary hash to a hexadecimal string the
+least-significant byte appears first, and the most-significant byte
+last.
+
+For example, the legacy Bitcoin address from the genesis block
+
+    1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa
+
+has P2PKH script
+
+    76a91462e907b15cbf27d5425399ebf6f0fb50ebb88f1888ac
+
+with SHA256 hash
+
+    6191c3b590bfcfa0475e877c302da1e323497acf3b42c08d8fa28e364edf018b
+
+which is sent to the server reversed as
+
+    8b01df4e368ea28f8dc0423bcf7a4923e3a12d307c875e47a0cfbf90b5c39161
+
+By subscribing to this hash you can find P2PKH payments to that address.
+
+One public key for that address (the genesis block public key) is
+
+    04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb
+    649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f
+
+which has P2PK script
+
+    4104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb
+    649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac
+
+with SHA256 hash
+
+    3318537dfb3135df9f3d950dbdf8a7ae68dd7c7dfef61ed17963ff80f3850474
+
+which is sent to the server reversed as
+
+    740485f380ff6379d11ef6fe7d7cdd68aea7f8bd0d953d9fdf3531fb7d531833
+
+By subscribing to this hash you can find P2PK payments to that public
+key.  Note the Genesis block coinbase is unspendable and therefore not
+indexed.
 
 
 Protocol Version 1.0
@@ -205,19 +258,6 @@ Return the unconfirmed transactions of a bitcoin address.
   ]
 
 
-blockchain.address.get_proof
-============================
-
-This method is optional and deprecated, and hence its response will
-not be described here.
-
-  blockchain.address.get_proof(**address**)
-
-  **address**
-
-    The address as a Base58 string.
-
-
 blockchain.address.listunspent
 ==============================
 
@@ -232,14 +272,17 @@ Return an ordered list of UTXOs sent to a bitcoin address.
 **Response**
 
     A list of unspent outputs in blockchain order.  Each transaction
-    is a dictionary with keys *height* , *tx_pos*, *tx_height* and
+    is a dictionary with keys *height* , *tx_pos*, *tx_hash* and
     *value* keys.  *height* is the integer height of the block the
-    transaction was confirmed in; if unconfirmed then *height* is 0 if
-    all inputs are confirmed, and -1 otherwise.  *tx_hash* the
-    transaction hash in hexadecimal, *tx_pos* the zero-based index of
-    the output in the transaction's list of outputs, and *value* its
-    integer value in minimum coin units (satoshis in the case of
-    Bitcoin).
+    transaction was confirmed in,  *tx_hash* the transaction hash in
+    hexadecimal, *tx_pos* the zero-based index of the output in the
+    transaction's list of outputs, and *value* its integer value in
+    minimum coin units (satoshis in the case of Bitcoin).
+
+    This function takes the mempool into account.  Mempool
+    transactions paying to the address are included at the end of the
+    list in an undefined order, each with *tx_height* of zero.  Any
+    output that is spent in the mempool does not appear.
 
 **Response Example**
 
@@ -382,14 +425,25 @@ Subscribe to receive block headers when a new block is found.
 
 **Response**
 
-  The *deserialized header* [2]_ of the current block.
+  The *deserialized header* [2]_ of the current block chain tip.
 
 **Notification Parameters**
 
   As this is a subcription, the client will receive a notification
   when a new block is found.  The parameters are:
 
-    [**header**]
+    [**deserialized_header**]
+
+  **NOTE**: if a new block comes in quickly so the server has not
+  finished processing the prior block(s), it may skip them and only
+  notify of the new tip.  The protocol does not guarantee
+  notifications of all intermediate blocks.
+
+  In a similar vein, the client also needs to be able to handle chain
+  reorganisations; in case of a re-org the new tip will not connect
+  directly onto the prior chain tip.  The client needs to be able to
+  figure out where the connection point and request any missing block
+  headers.
 
 
 blockchain.numblocks.subscribe
@@ -618,9 +672,8 @@ following changes:
 
 * improved semantics of `server.version` to aid protocol negotiation,
   and a changed return value.
-* version 1.0 methods `blockchain.address.get_proof`,
-  `blockchain.utxo.get_address` and `blockchain.numblocks.subscribe`
-  have been removed.
+* version 1.0 methods `blockchain.utxo.get_address`
+  and `blockchain.numblocks.subscribe` have been removed.
 * method `blockchain.transaction.get` no longer takes the *height*
   argument that was ignored in 1.0, providing one will return an
   error.
@@ -846,8 +899,7 @@ Get a list of features and services supported by the server.
 * **protocol_min**
 
   Strings that are the minimum and maximum Electrum protocol versions
-  this server speaks.  The maximum value should be the same as what
-  would suffix the letter **v** in the IRC real name.  Example: "1.1".
+  this server speaks.  Example: "1.1".
 
 * **pruning**
 
@@ -868,6 +920,36 @@ Get a list of features and services supported by the server.
       "server_version": "ElectrumX 1.0.17",
       "hash_function": "sha256"
   }
+
+Protocol Version 1.2
+--------------------
+
+Protocol version 1.2 is the same as version `1.1` except for the
+addition of a new method `mempool.get_fee_histogram`.
+
+All methods with taking addresses are deprecated, and will be removed
+at some point in the future.  You should update your code to use
+`Script Hashes`_ and the scripthash methods introduced in protocol 1.1
+instead.
+
+
+mempool.get_fee_histogram
+=========================
+
+Request a histogram of the fee rates paid by transactions in the memory
+pool, weighted by transaction size.
+
+  mempool.get_fee_histogram()
+
+**Response**
+
+  The histogram is an array of [fee, vsize] pairs, where vsize_n is
+  the cumulative virtual size of mempool transactions with a fee rate
+  in the interval [fee_(n-1), fee_n)], and fee_(n-1) > fee_n.
+
+Fee intervals may have variable size.  The choice of appropriate
+intervals is currently not part of the protocol.
+
 
 .. _JSON RPC 1.0: http://json-rpc.org/wiki/specification
 .. _JSON RPC 2.0: http://json-rpc.org/specification
